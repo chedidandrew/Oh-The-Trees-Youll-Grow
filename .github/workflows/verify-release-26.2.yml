@@ -1,0 +1,382 @@
+name: Verify and release Fabric 26.2 chunk fix
+
+on:
+  push:
+    branches:
+      - fix/26.2-saved-chunk-ticks
+      - release/mc26.2-fabric-11.0.2-chunkfix.1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ottyg-26.2-chunkfix-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BASE_SHA: 528ce615d4c3362748dbe9a929c75e6782543515
+  VERSION: 11.0.2-chunkfix.1
+  TAG: mc26.2-fabric-11.0.2-chunkfix.1
+  JAR_NAME: ohthetreesyoullgrow-fabric-26.2-11.0.2-chunkfix.1.jar
+  EXPECTED_SHA256: 5b80134bba4140b02d93eb1bb64b746e6e9011afbdde65e3c39985775247d82d
+
+jobs:
+  verify:
+    name: Build, test, and audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+
+    steps:
+      - name: Check out the fixed source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify source lineage and publication scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$BASE_SHA" HEAD
+          git diff --exit-code "$BASE_SHA" -- LICENSE
+
+          git diff --name-only "$BASE_SHA"...HEAD | LC_ALL=C sort > actual-files.txt
+          printf '%s\n' \
+            '.github/workflows/verify-release-26.2.yml' \
+            'CHANGELOG.md' \
+            'EXPECTED_SHA256SUMS.txt' \
+            'NOTICE.md' \
+            'PORTING.md' \
+            'README.md' \
+            'RELEASE_NOTES.md' \
+            'ci/inject_saved_tick_fixture.py' \
+            'common/src/main/java/dev/corgitaco/ohthetreesyoullgrow/mixin/chunk/MixinChunkSerializer.java' \
+            'fabric/src/main/resources/fabric.mod.json' \
+            'gradle.properties' \
+            'settings.gradle.kts' \
+            | LC_ALL=C sort > expected-files.txt
+          diff -u expected-files.txt actual-files.txt
+
+      - name: Set up Zulu JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "25"
+
+      - name: Verify the fixed source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          serializer = Path("common/src/main/java/dev/corgitaco/ohthetreesyoullgrow/mixin/chunk/MixinChunkSerializer.java").read_text()
+          assert serializer.count('import net.minecraft.world.level.chunk.ImposterProtoChunk;') == 1
+          assert serializer.count('corgiLibTag.getList("scheduled_random_ticks").orElseThrow()') == 1
+          assert serializer.count('scheduledTickTarget = imposterProtoChunk.getWrapped();') == 1
+          assert 'tag.getList("scheduled_random_ticks").orElseThrow()' not in serializer
+          assert '((RandomTickScheduler) cir.getReturnValue()).getScheduledRandomTicks()' not in serializer
+
+          properties = Path("gradle.properties").read_text()
+          assert properties.count("version=11.0.2-chunkfix.1") == 1
+
+          settings = Path("settings.gradle.kts").read_text()
+          assert 'include("common")' in settings
+          assert 'include("fabric")' in settings
+          assert 'include("neoforge")' not in settings
+          assert 'include("forge")' not in settings
+
+          metadata = json.loads(Path("fabric/src/main/resources/fabric.mod.json").read_text())
+          assert metadata["depends"] == {
+              "fabricloader": ">=0.19.3",
+              "fabric-api": ">=0.152.2",
+              "minecraft": "~26.2",
+              "java": ">=25",
+          }
+          PY
+
+      - name: Build Common and Fabric
+        shell: bash
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon \
+            :common:publishToMavenLocal \
+            :fabric:publishToMavenLocal \
+            :fabric:build \
+            --stacktrace
+
+      - name: Verify compiled saved chunk fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          jar_path="fabric/build/libs/$JAR_NAME"
+          test -f "$jar_path"
+          javap -classpath "$jar_path" -c -p \
+            dev.corgitaco.ohthetreesyoullgrow.mixin.chunk.MixinChunkSerializer \
+            > serializer.javap
+          grep -F \
+            'net/minecraft/world/level/chunk/ImposterProtoChunk.getWrapped:()Lnet/minecraft/world/level/chunk/LevelChunk;' \
+            serializer.javap
+
+      - name: Run two-boot saved chunk regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p run fabric/run smoke-logs
+          printf 'eula=true\n' > run/eula.txt
+          printf 'eula=true\n' > fabric/run/eula.txt
+          printf 'online-mode=false\n' > run/server.properties
+          printf 'online-mode=false\n' > fabric/run/server.properties
+
+          run_server() {
+            label="$1"
+            console_log="server-${label}-console.log"
+            saved_log="smoke-logs/server-${label}-latest.log"
+            input_fifo="server-${label}.stdin"
+            latest_log=""
+            ready=0
+            server_status=0
+            forced_shutdown=0
+
+            rm -f fabric/run/logs/latest.log run/logs/latest.log "$input_fifo"
+            mkfifo "$input_fifo"
+            setsid ./gradlew --no-daemon :fabric:runServer --console=plain \
+              < "$input_fifo" > "$console_log" 2>&1 &
+            server_pid=$!
+            exec 9>"$input_fifo"
+
+            for _ in $(seq 1 180); do
+              for candidate in fabric/run/logs/latest.log run/logs/latest.log; do
+                if test -f "$candidate"; then
+                  latest_log="$candidate"
+                  if grep -Fq "Done (" "$candidate"; then
+                    ready=1
+                    break 2
+                  fi
+                fi
+              done
+
+              if ! kill -0 "$server_pid" 2>/dev/null; then
+                wait "$server_pid" || server_status=$?
+                break
+              fi
+              sleep 1
+            done
+
+            if test "$ready" -eq 1; then
+              if test "$label" = "first"; then
+                printf 'forceload add 0 0\n' >&9
+                sleep 20
+                printf 'setblock 0 0 0 minecraft:gold_block\n' >&9
+                sleep 5
+                printf 'save-all flush\n' >&9
+                sleep 5
+              fi
+              printf 'stop\n' >&9 || true
+            fi
+            exec 9>&-
+
+            for _ in $(seq 1 45); do
+              kill -0 "$server_pid" 2>/dev/null || break
+              sleep 1
+            done
+            if kill -0 "$server_pid" 2>/dev/null; then
+              forced_shutdown=1
+              kill -INT -- "-$server_pid" 2>/dev/null || true
+              sleep 2
+              kill -TERM -- "-$server_pid" 2>/dev/null || true
+              for _ in $(seq 1 10); do
+                kill -0 "$server_pid" 2>/dev/null || break
+                sleep 1
+              done
+              if kill -0 "$server_pid" 2>/dev/null; then
+                kill -KILL -- "-$server_pid" 2>/dev/null || true
+              fi
+            fi
+            if wait "$server_pid" 2>/dev/null; then
+              server_status=0
+            else
+              server_status=$?
+            fi
+            rm -f "$input_fifo"
+
+            if test "$ready" -ne 1; then
+              tail -n 300 "$console_log"
+              return 1
+            fi
+
+            test -n "$latest_log"
+            cp "$latest_log" "$saved_log"
+            if grep -Eiq \
+              'Mixin apply failed|InvalidInjectionException|Critical injection failure|Failed to start the minecraft server|readScheduledRandomTicks|NoSuchElementException|Failed to load chunk|Error upgrading chunk' \
+              "$saved_log" "$console_log"; then
+              tail -n 300 "$saved_log"
+              return 1
+            fi
+
+            if ! grep -Fq "Stopping server" "$saved_log" || \
+               ! grep -Fq "All dimensions are saved" "$saved_log"; then
+              echo "Server did not record a clean stop and complete world save" >&2
+              tail -n 300 "$saved_log"
+              return 1
+            fi
+            if test "$forced_shutdown" -eq 0 && test "$server_status" -ne 0; then
+              echo "Gradle dev-launch process exited with status $server_status" >&2
+              tail -n 300 "$console_log"
+              return 1
+            fi
+
+            grep -F "All dimensions are saved" "$saved_log" | tail -1
+            grep -F "Done (" "$saved_log" | tail -1
+          }
+
+          run_server first
+          mapfile -t fixture_regions < <(
+            find fabric/run run -type f \
+              -path '*/world/dimensions/minecraft/overworld/region/r.0.0.mca' \
+              -print
+          )
+          if test "${#fixture_regions[@]}" -ne 1; then
+            echo "Expected exactly one Overworld terrain region; found ${#fixture_regions[@]}" >&2
+            find fabric/run run -maxdepth 10 -type f -print | sort
+            exit 1
+          fi
+          python3 ci/inject_saved_tick_fixture.py "${fixture_regions[0]}"
+          run_server second
+
+      - name: Audit and stage the release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          jar_path="fabric/build/libs/$JAR_NAME"
+          mkdir -p artifact
+          cp "$jar_path" artifact/
+          cp LICENSE NOTICE.md RELEASE_NOTES.md artifact/
+          (
+            cd artifact
+            sha256sum "$JAR_NAME" > SHA256SUMS.txt
+            sha256sum -c ../EXPECTED_SHA256SUMS.txt
+          )
+
+          python3 - "$jar_path" <<'PY'
+          import json
+          import stat
+          import sys
+          import zipfile
+          from pathlib import Path, PurePosixPath
+
+          jar_path = Path(sys.argv[1])
+          with zipfile.ZipFile(jar_path) as archive:
+              infos = archive.infolist()
+              names = [info.filename for info in infos]
+              assert len(infos) == 94, len(infos)
+              assert len(names) == len(set(names)), "duplicate jar entries"
+              for info in infos:
+                  path = PurePosixPath(info.filename)
+                  assert not path.is_absolute() and ".." not in path.parts, info.filename
+                  assert not info.flag_bits & 1, f"encrypted entry: {info.filename}"
+                  assert not stat.S_ISLNK((info.external_attr >> 16) & 0xFFFF), info.filename
+                  archive.read(info)
+
+              metadata = json.loads(archive.read("fabric.mod.json"))
+              assert metadata["id"] == "ohthetreesyoullgrow"
+              assert metadata["version"] == "11.0.2-chunkfix.1"
+              assert metadata["depends"] == {
+                  "fabricloader": ">=0.19.3",
+                  "fabric-api": ">=0.152.2",
+                  "minecraft": "~26.2",
+                  "java": ">=25",
+              }
+              assert "dev/corgitaco/ohthetreesyoullgrow/mixin/chunk/MixinChunkSerializer.class" in names
+              embedded_license = archive.read("LICENSE_Oh The Trees You'll Grow")
+
+              class_majors = {
+                  int.from_bytes(archive.read(name)[6:8], "big")
+                  for name in names
+                  if name.endswith(".class")
+              }
+              assert class_majors == {69}, class_majors
+
+          assert embedded_license == Path("LICENSE").read_bytes()
+          PY
+
+          grep -Fx "$EXPECTED_SHA256  $JAR_NAME" artifact/SHA256SUMS.txt
+
+      - name: Upload verified build
+        uses: actions/upload-artifact@v4
+        with:
+          name: ottyg-fabric-26.2-chunkfix.1
+          path: artifact/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload regression logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ottyg-fabric-26.2-regression-logs
+          path: |
+            server-*-console.log
+            smoke-logs
+            fabric/run/logs
+            run/logs
+            serializer.javap
+          if-no-files-found: ignore
+          retention-days: 7
+
+  release:
+    name: Publish verified prerelease
+    needs: verify
+    if: >-
+      github.repository == 'chedidandrew/Oh-The-Trees-Youll-Grow' &&
+      github.ref == 'refs/heads/release/mc26.2-fabric-11.0.2-chunkfix.1'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download the verified files from this run
+        uses: actions/download-artifact@v4
+        with:
+          name: ottyg-fabric-26.2-chunkfix.1
+          path: artifact
+
+      - name: Recheck the release artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd artifact
+          sha256sum -c SHA256SUMS.txt
+          grep -Fx "$EXPECTED_SHA256  $JAR_NAME" SHA256SUMS.txt
+
+      - name: Create and publish the GitHub prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists" >&2
+            exit 1
+          fi
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists" >&2
+            exit 1
+          fi
+
+          gh release create "$TAG" \
+            "artifact/$JAR_NAME" \
+            artifact/SHA256SUMS.txt \
+            artifact/LICENSE \
+            artifact/NOTICE.md \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Unofficial Fabric 26.2 saved chunk fix" \
+            --notes-file artifact/RELEASE_NOTES.md \
+            --prerelease \
+            --draft
+
+          gh release edit "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --prerelease
