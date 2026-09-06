@@ -11,6 +11,7 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.ai.village.poi.PoiManager;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.chunk.ChunkAccess;
+import net.minecraft.world.level.chunk.ImposterProtoChunk;
 import net.minecraft.world.level.chunk.ProtoChunk;
 import net.minecraft.world.level.chunk.storage.RegionStorageInfo;
 import net.minecraft.world.level.chunk.storage.SerializableChunkData;
@@ -55,9 +56,13 @@ public class MixinChunkSerializer {
         if (tag.contains(Constants.MOD_ID)) {
             CompoundTag corgiLibTag = tag.getCompound(Constants.MOD_ID).orElseThrow();
             if (corgiLibTag.contains("scheduled_random_ticks")) {
-                for (Tag scheduledTick : tag.getList("scheduled_random_ticks").orElseThrow()) {
+                ChunkAccess scheduledTickTarget = cir.getReturnValue();
+                if (scheduledTickTarget instanceof ImposterProtoChunk imposterProtoChunk) {
+                    scheduledTickTarget = imposterProtoChunk.getWrapped();
+                }
+                for (Tag scheduledTick : corgiLibTag.getList("scheduled_random_ticks").orElseThrow()) {
                     int[] intArrayTag = ((IntArrayTag) scheduledTick).getAsIntArray();
-                    ((RandomTickScheduler) cir.getReturnValue()).getScheduledRandomTicks().add(new BlockPos(intArrayTag[0], intArrayTag[1], intArrayTag[2]));
+                    ((RandomTickScheduler) scheduledTickTarget).getScheduledRandomTicks().add(new BlockPos(intArrayTag[0], intArrayTag[1], intArrayTag[2]));
                 }
             }
         }
