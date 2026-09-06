@@ -1,3 +1,8 @@
+# 11.0.2-chunkfix.1 - Unofficial Fabric 26.2 personal test fix
+* Read saved scheduled random ticks from the nested ohthetreesyoullgrow NBT compound.
+* Restore saved ticks to the wrapped LevelChunk when Minecraft returns an ImposterProtoChunk.
+* Prevents NoSuchElementException and repeated chunk-load failures after BWG tree data is saved.
+
 # 11.0.1
 * Add a way to define a single leaves block state provider in the builder.
 
