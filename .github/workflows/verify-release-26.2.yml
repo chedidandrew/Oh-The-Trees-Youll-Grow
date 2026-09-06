@@ -11,7 +11,7 @@ permissions:
 
 concurrency:
   group: ottyg-26.2-chunkfix-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   BASE_SHA: 528ce615d4c3362748dbe9a929c75e6782543515
@@ -25,8 +25,23 @@ jobs:
     name: Build, test, and audit
     runs-on: ubuntu-24.04
     timeout-minutes: 55
+    permissions:
+      contents: read
+      statuses: write
 
     steps:
+      - name: Report verification start
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method POST \
+            "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state=pending \
+            -f context=ottyg-26.2/verified \
+            -f description='Building and running the saved chunk regression' \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
       - name: Check out the fixed source
         uses: actions/checkout@v4
         with:
@@ -323,6 +338,26 @@ jobs:
             serializer.javap
           if-no-files-found: ignore
           retention-days: 7
+
+      - name: Report verification result
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_RESULT: ${{ job.status }}
+        run: |
+          state=success
+          description='Build, regression, archive audit, and checksum passed'
+          if test "$JOB_RESULT" != success; then
+            state=failure
+            description="Verification ended with status: $JOB_RESULT"
+          fi
+          gh api --method POST \
+            "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$state" \
+            -f context=ottyg-26.2/verified \
+            -f description="$description" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
   release:
     name: Publish verified prerelease
